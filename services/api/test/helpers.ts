@@ -37,6 +37,10 @@ export class FakeChain implements ChainSource {
   calls = 0;
   /** Throw on this getEvents call (1-based), once. */
   failOnCall: number | undefined;
+  /** A promise to await inside getEvents before proceeding, for deterministic concurrency tests. */
+  gate: Promise<void> | undefined;
+  /** A callback fired upon entering getEvents before awaiting gate. */
+  onGetEvents: (() => void | Promise<void>) | undefined;
 
   push(assetId: string, kind: EventKind, ledger: number, f: Partial<AssetEvent> = {}): AssetEvent {
     const toid = (BigInt(ledger) << 32n).toString().padStart(19, "0");
@@ -60,6 +64,8 @@ export class FakeChain implements ChainSource {
 
   async getEvents(contractId: string, from: { startLedger: number } | { cursor: string }, limit: number): Promise<EventPage> {
     this.calls++;
+    if (this.onGetEvents) await this.onGetEvents();
+    if (this.gate) await this.gate;
     if (this.failOnCall === this.calls) {
       this.failOnCall = undefined;
       throw new Error("connection reset");
@@ -105,6 +111,19 @@ export class FakeChain implements ChainSource {
     if (options.retain !== undefined) {
       this.oldest = Math.max(this.oldest, this.latest - options.retain + 1);
     }
+  }
+
+  /**
+   * Hold getEvents until release() is called. `entered` resolves once a call is waiting on the
+   * hold, so a test can act while a sync pass is known to be in flight, without sleeping.
+   */
+  hold(): { entered: Promise<void>; release: () => void } {
+    let entered!: () => void;
+    let release!: () => void;
+    const whenEntered = new Promise<void>((resolve) => (entered = resolve));
+    this.gate = new Promise<void>((resolve) => (release = resolve));
+    this.onGetEvents = () => entered();
+    return { entered: whenEntered, release };
   }
 }
 
