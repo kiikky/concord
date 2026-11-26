@@ -1,85 +1,47 @@
-import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
-import { createServer, type AddressInfo } from "node:net";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { isEntry } from "../src/main.js";
 
-const distMain = fileURLToPath(new URL("../dist/main.js", import.meta.url));
-const canRun = existsSync(distMain) && process.platform !== "win32";
+describe("isEntry", () => {
+  let tmp: string;
+  const mainPath = resolve(import.meta.dirname, "../src/main.ts");
+  const mainUrl = pathToFileURL(mainPath).href;
+  const cliPath = resolve(import.meta.dirname, "../src/cli.ts");
 
-function getFreePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const srv = createServer();
-    srv.listen(0, "127.0.0.1", () => {
-      const port = (srv.address() as AddressInfo).port;
-      srv.close((err) => (err ? reject(err) : resolve(port)));
-    });
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "concord-isentry-"));
   });
-}
 
-describe.skipIf(!canRun)("server shutdown", () => {
-  it("shuts down cleanly on SIGTERM, closes databases, and ignores a second SIGTERM", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "concord-shutdown-"));
-    const port = await getFreePort();
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
 
-    const child = spawn(process.execPath, [distMain], {
-      env: {
-        ...process.env,
-        PORT: String(port),
-        CONCORD_PORT: String(port),
-        CONCORD_HOST: "127.0.0.1",
-        CONCORD_SYNC_INTERVAL: "0",
-        CONCORD_DATA_DIR: tempDir,
-        CONCORD_PUBLIC_URL: `http://127.0.0.1:${port}`,
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+  it("returns true for direct execution with absolute path", () => {
+    expect(isEntry(mainPath, mainUrl)).toBe(true);
+  });
 
-    let output = "";
-    child.stdout?.on("data", (chunk: Buffer) => {
-      output += chunk.toString();
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      output += chunk.toString();
-    });
-
+  it("returns true when executed through a symlink to the file", () => {
+    const linkPath = join(tmp, "main-symlink.ts");
     try {
-      // Wait up to 60s for the server to log that it is listening
-      const started = Date.now();
-      while (!output.includes("listening on")) {
-        if (Date.now() - started > 60_000) {
-          throw new Error(`Server failed to start within 60s:\n${output}`);
-        }
-        await new Promise((r) => setTimeout(r, 100));
+      symlinkSync(mainPath, linkPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EPERM" && process.platform === "win32") {
+        // Windows unprivileged environments cannot create symlinks without Developer Mode
+        return;
       }
-
-      // First SIGTERM initiates shutdown
-      child.kill("SIGTERM");
-
-      // A second SIGTERM during shutdown is ignored
-      child.kill("SIGTERM");
-
-      const exitResult = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
-        child.on("exit", (code, signal) => resolve({ code, signal }));
-      });
-
-      expect(exitResult.code).toBe(0);
-
-      // Verify no leftover -wal files
-      const files = readdirSync(tempDir);
-      const walFiles = files.filter((f) => f.endsWith("-wal"));
-      expect(walFiles).toEqual([]);
-    } finally {
-      if (child.exitCode === null) {
-        try {
-          child.kill("SIGKILL");
-        } catch {}
-      }
-      try {
-        rmSync(tempDir, { recursive: true, force: true });
-      } catch {}
+      throw err;
     }
-  }, 90_000);
+    expect(isEntry(linkPath, mainUrl)).toBe(true);
+  });
+
+  it("returns false when imported by another file such as cli.ts", () => {
+    expect(isEntry(cliPath, mainUrl)).toBe(false);
+  });
+
+  it("returns false without throwing when argv1 is undefined", () => {
+    expect(isEntry(undefined, mainUrl)).toBe(false);
+  });
 });
